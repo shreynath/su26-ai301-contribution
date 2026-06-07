@@ -7,8 +7,7 @@
 
 ### Issue
 
-> 🔗 **[PASTE THE LINK FROM THE SPREADSHEET HERE]**  
-> *(Open the AI301 Candidate Issues Google Sheet → find the pwndbg row "some x86_64 syscall args not annotated" → click the "GitHub" cell link → paste that URL above)*
+> 🔗 **https://docs.google.com/spreadsheets/d/1_MuOCiQmaMo6MmDOjawojZ8pS5DLzwjFTVYepca2deM/edit?gid=0#gid=0**  
 
 **Repository:** pwndbg/pwndbg  
 **Organization:** pwndbg  
