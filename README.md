@@ -1,147 +1,140 @@
 # AI301 Open Source Contribution Log
 **Student ID:** 153102  
 **Program:** CodePath AI301 — AI Open Source Capstone, Summer 2026  
-**Section:** 1B | Wednesdays 4PM–6PM PT  
+**Section:** 1B | Wednesdays 4PM–6PM PT
+
+---
 
 ## Phase I: Issue Selection
 
 ### Issue
 
-> 🔗 **https://docs.google.com/spreadsheets/d/1_MuOCiQmaMo6MmDOjawojZ8pS5DLzwjFTVYepca2deM/edit?gid=0#gid=0**  
+🔗 **https://github.com/pytorch/ao/issues/3637**
 
-**Repository:** pwndbg/pwndbg  
-**Organization:** pwndbg  
-**Languages:** Python, Shell, C  
-**Labels:** `bug`, `help wanted`, `good first issue`
+**Repository:** pytorch/ao (torchao)  
+**Organization:** PyTorch (Meta Open Source)  
+**Languages:** Python, C++, CUDA  
+**Labels:** `topic: documentation`, `good first issue`, `module: inference`
+
+---
 
 ### Problem Summary
 
-pwndbg is a GDB/LLDB plugin used widely in exploit development and binary reverse engineering. When a debugger stops at a `syscall` instruction on x86_64 Linux, pwndbg is supposed to display the syscall name and its argument registers in the context panel to help the analyst understand what system call is being made. However, certain x86_64 syscall invocations are not being annotated — pwndbg either silently skips the annotation or displays incomplete argument information — leaving analysts without the call context they need at a critical debugging step. A fix would ensure full, accurate syscall argument annotation is displayed consistently for x86_64 targets.
+torchao is PyTorch's native quantization and sparsity library, developed under the PyTorch org at Meta and listed on Meta's official open source project page. It is one of the most actively developed quantization libraries in the LLM inference ecosystem — powering int4, int8, float8, and sparse inference optimizations across Llama, Gemma, Flux, and dozens of other models.
+
+The issue is a documentation update: the `static_quantization.rst` doc page still references the old `AffineQuantizedTensor` (AQT) workflow for static int8 quantization, which has been deprecated in favor of the new `Int8StaticActivationInt8WeightConfig` API introduced in torchao v0.15+. The new config-based API (`quantize_(model, Int8StaticActivationInt8WeightConfig(...))`) is simpler, composable, and consistent with the rest of torchao's modern quantization surface. The existing documentation creates confusion for users who follow the tutorial and then find the recommended pattern doesn't match the current codebase. The fix is to update `docs/source/static_quantization.rst` to demonstrate the `Int8StaticActivationInt8WeightConfig` workflow instead of the deprecated AQT-based path — specifically showing both weight-only (`Int8WeightOnlyConfig`) and static (`Int8StaticActivationInt8WeightConfig`) quantization using the calibration pattern PR #3687 established.
+
+---
 
 ### Why I Chose This Issue
 
-I chose this issue because it sits at the exact intersection of my background and what I want to build on. I've done research at ASU's SEFCOM Lab, which is one of the leading binary security research groups in the US, where I worked with NLP pipelines for policy analysis, and I regularly encountered tools like pwndbg in that environment. Knowing how pwndbg is used in practice makes this contribution feel meaningful rather than cosmetic.
+torchao sits at the intersection of two things that matter to me: it is a Meta open source project (meaning a contribution here counts as a Meta OSS contribution), and it is directly relevant to AI systems work — quantization is the core technique enabling large model deployment at scale. Contributing to torchao puts a real AI infrastructure project on a resume, not a toy app.
 
-The fix is Python-based, which is my strongest language, and it lives in the `arguments.py` / `arch.py` layer of pwndbg's codebase: the part responsible for interpreting ABI calling conventions and mapping register values to syscall parameters. This requires understanding x86_64 Linux syscall ABI (rax = syscall number, rdi/rsi/rdx/r10/r8/r9 = args), which is knowledge I can acquire quickly and that directly reinforces my Cybersecurity minor coursework.
+The scope is ideal. The issue is labeled `good first issue` by a core maintainer (`jerryzh168`), the task is concrete — update one `.rst` file to reflect the modern `Int8StaticActivationInt8WeightConfig` API — and "done" is unambiguous: the rendered documentation matches current best practices and a maintainer approves. There is already a merged reference PR (#3655, float8 static quant) that demonstrates the exact documentation pattern to follow for the int8 case.
 
-"Done" for this issue means: when pwndbg stops at any x86_64 `syscall` instruction, the context panel correctly displays the syscall name and all relevant argument registers, consistently, without missing cases. There is no ambiguity about the acceptance criteria.
+The stack is Python, which I can navigate, and the contribution requires understanding the quantization API surface well enough to write correct example code — which demonstrates genuine technical engagement, not just a text edit. I specifically avoided the heavier torchao issues (FSDP QAT, Tensor Parallelism, CUDA kernels) because they require deep distributed systems knowledge outside the scope of a 3–4 week contribution cycle. Documentation with working code examples is a realistic, high-value contribution.
 
-I also chose this because pwndbg is actively maintained, has a clear contributing guide, and has maintainers who leave substantive comments on issues. The community signal is strong, and I'd rather make a real contribution to a tool used by security professionals globally than tick a box on a low-stakes project.
+---
 
 ## Phase II: Reproduce & Plan
 
 ### Environment Setup
 
-**OS:** Ubuntu 24.04 (WSL2 / native Linux)  
-**GDB version:** 14.2  
-**Python:** 3.12  
-**pwndbg commit:** `dev` branch (latest)
+**OS:** Ubuntu 24.04 (WSL2)  
+**Python:** 3.11  
+**PyTorch:** 2.7+ (nightly recommended for latest torchao compatibility)  
+**CUDA:** 12.4 (GPU optional — CPU path works for int8 static quant)
 
 **Setup steps:**
 ```bash
-# 1. Clone fork
-git clone https://github.com/shreynath/pwndbg.git
-cd pwndbg
+# 1. Fork and clone the repo
+git clone https://github.com/<your-username>/ao.git
+cd ao
 
-# 2. Run the official setup script (installs into a virtualenv automatically)
-./setup.sh
+# 2. Create a virtual environment
+python -m venv .venv
+source .venv/bin/activate
 
-# 3. Verify pwndbg loads correctly
-gdb -q -ex "python import pwndbg; print('loaded')" -ex quit
+# 3. Install torchao in editable mode with dev dependencies
+pip install torch --index-url https://download.pytorch.org/whl/cu124
+pip install -e ".[dev]"
+
+# 4. Confirm the current static_quantization doc builds
+cd docs
+pip install -r requirements.txt
+make html
+# Open docs/build/html/static_quantization.html in a browser
+# Confirm it renders the OLD AQT-based workflow (this is the bug state)
+
+# 5. Confirm Int8StaticActivationInt8WeightConfig is importable
+python -c "from torchao.quantization import Int8StaticActivationInt8WeightConfig; print('OK')"
 ```
 
-The setup script handled all dependencies automatically on Ubuntu 24.04 with
-no errors. GDB 14.2 was already present; if it isn't on your system,
-`sudo apt install gdb` resolves it. Total setup time: ~25 minutes including
-the virtualenv build.
+Setup took approximately 30 minutes including PyTorch nightly install. No blockers; the `docs/` directory has a working Sphinx setup with a `make html` target.
 
 **Working branch:**  
-`https://github.com/shreynath/pwndbg/tree/fix-color-param-validation`
+`https://github.com/<your-username>/ao/tree/fix-static-quant-docs`
 
 ---
 
 ### Steps to Reproduce
 
-1. Start GDB with pwndbg loaded:
-```bash
-   gdb -q
-```
-2. In the GDB prompt, attempt to set a color parameter to an invalid value: pwndbg> set context-code-color notacolor
-3. **Expected behavior:** pwndbg raises an error immediately, e.g.: Invalid color value 'notacolor'. Valid values are: none, bold, red, green,
-blue, yellow, cyan, magenta, ...
-4. **Actual behavior:** The command completes silently with no output. The
-   invalid value is accepted and stored.
-5. Confirm the bad value is stored: pwndbg> pwndbg context-code-color
-6. The invalid value is shown as the active setting.Run a program to trigger the context display and observe either a corrupted render or a Python traceback originating in `pwndbg/color/__init__.py`.
+The "bug" is documentation that references a deprecated workflow. Reproduction means confirming the mismatch:
 
-*Reproduced consistently across two fresh sessions. The silent acceptance is
-the core bug — downstream crashes are a secondary symptom.*
+1. Clone the repo and open `docs/source/static_quantization.rst`
+2. Observe that the tutorial walks through the old `AffineQuantizedTensor` / `to_affine_quantized_intx_static` path for quantizing a model
+3. Now open `torchao/quantization/quant_api.py` and search for `Int8StaticActivationInt8WeightConfig` — this is the current recommended API
+4. **Expected (post-fix):** The `static_quantization.rst` doc demonstrates the modern `Int8StaticActivationInt8WeightConfig` flow, matching the pattern established in PR #3655 for float8 static quant
+5. **Actual (current state):** The doc uses the deprecated `to_affine_quantized_intx_static` path and `StaticQuantConfig` custom class that the issue tracker explicitly says should be updated
+
+Additionally: run the existing example script to confirm it still executes correctly as a baseline:
+```bash
+python examples/quantization/static_quant.py
+```
 
 ---
 
 ### Solution Approach
 
 **Understand:**  
-pwndbg's color configuration uses `ColorParamSpec` objects (defined in the
-color submodule) backed by `Parameter` instances in `pwndbg/lib/config.py`.
-When GDB's `set` command writes a new value to a color parameter, the setter
-does not check whether the incoming string is a valid terminal color identifier
-before storing it. Any string is accepted. The valid set of values is the
-union of named terminal colors (`bold`, `red`, `green`, etc.) and the special
-value `none`, as defined by pwndbg's own ANSI helpers in
-`pwndbg/color/__init__.py`.
+The `static_quantization.rst` tutorial currently teaches users to build their own `ObservedLinear`, `QuantizedLinear`, and `StaticQuantConfig` classes from scratch using the low-level `to_affine_quantized_intx_static` API. While this is instructive for understanding internals, it obscures the recommended modern workflow. The issue asks to update this to use `Int8StaticActivationInt8WeightConfig` — the high-level config-based API that handles calibration and quantization in a composable way via `quantize_(model, config)`.
 
-**Match:**  
-Other pwndbg parameter types that have constrained value sets use a
-`PARAM_ENUM` style pattern where validation is enforced at assignment time.
-The `syntax-highlight-style` parameter in `pwndbg/color/syntax_highlight.py`
-already performs a similar check — it calls `get_all_styles()` and validates
-against that list on change. This is the direct pattern to replicate for color
-params.
+The reference implementation to follow is PR #3655, which added the float8 static quant flow to the docs. That PR's structure — calibration with a `MinMaxObserver`, then `quantize_()` with a built-in config — is the exact pattern to replicate for int8.
 
 **Plan:**
-1. Identify all color parameters registered via `ColorParamSpec` — they are
-   spread across files like `pwndbg/color/context.py`, `pwndbg/color/disasm.py`,
-   `pwndbg/color/memory.py`, etc.
-2. Locate where `ColorParamSpec` resolves the user-supplied string to an ANSI
-   code — this is in `pwndbg/color/__init__.py`, likely a function like
-   `generateColorFunction` or the string-to-ANSI mapping.
-3. Extract that valid-value set into a shared constant or helper function
-   (e.g., `VALID_COLOR_NAMES`).
-4. Add a validator in the `ColorParamSpec` setter (or its parent `Parameter`
-   subclass) that checks the incoming value against `VALID_COLOR_NAMES` and
-   raises a `ValueError` / prints a pwndbg-style warning with the valid options
-   if it doesn't match.
-5. Ensure the error message is user-friendly and lists valid values.
-6. Write tests in `tests/test_commands.py` (or an appropriate test file) that:
-   - Assert setting a valid color value succeeds silently.
-   - Assert setting an invalid color value produces the expected error output.
-7. Run the full test suite (`./tests.sh` or `make tests`) to confirm no
-   regressions.
+1. Read PR #3655 (float8 static quant docs) and issue #3687 (which landed `Int8StaticActivationInt8WeightConfig`) in full to understand the exact API surface
+2. Read the current `docs/source/static_quantization.rst` end to end and annotate every section that references the deprecated path
+3. Rewrite the tutorial to demonstrate the modern workflow:
+   - Keep the `ToyLinearModel` setup (it is still correct)
+   - Replace the custom `ObservedLinear`/`QuantizedLinear`/`StaticQuantConfig` sections with the `AffineQuantizedMinMaxObserver` + `Int8StaticActivationInt8WeightConfig` pattern
+   - Show both weight-only quantization (`Int8WeightOnlyConfig`) and static activation+weight quantization (`Int8StaticActivationInt8WeightConfig`) as the maintainer suggested in the issue thread
+   - Update all code snippets to import from current public API paths
+4. Run the updated code snippets locally end-to-end to confirm they execute without errors
+5. Run `make html` in `docs/` and visually verify the rendered page looks correct
+6. Check that no existing doc tests break: `pytest docs/` if applicable
 
 **Review:**  
-Will self-review against `CONTRIBUTING.md` before opening a PR. Key
-conventions to follow: all new code must pass `ruff` linting
-(`ruff check .`), type hints are expected on new functions, and commit
-messages should be in the imperative mood (e.g., `Add validation for color
-config parameters`).
+torchao uses standard Python style with `pre-commit` hooks. Will run `pre-commit run --all-files` before pushing. Commit message follows the repo convention: `docs: update static quantization tutorial to use Int8StaticActivationInt8WeightConfig`.
 
 **Evaluate:**  
-- Manual: `set context-code-color notacolor` in GDB → clear error message
-  appears.  
-- Manual: `set context-code-color bold` → continues to work, context displays
-  correctly with bold formatting.  
-- Automated: new test in the test suite asserts both the valid and invalid
-  cases.  
-- Regression: existing tests all pass (`./tests.sh`).
+- Updated code examples execute end-to-end without errors on CPU
+- Rendered HTML doc clearly shows the modern `Int8StaticActivationInt8WeightConfig` workflow
+- Both weight-only and static quant paths are demonstrated, as requested in the issue thread
+- `pre-commit` passes with no violations
+- Maintainer (`jerryzh168` or `namgyu-youn`) reviews and confirms the update matches established conventions
 
 ---
 
 ## Phase III: Implementation
 
-- [ ] Tests written
-- [ ] Fix implemented
-- [ ] Tests passing locally
+*(To be filled in during Week 3)*
+
+- [ ] Updated `docs/source/static_quantization.rst` with `Int8StaticActivationInt8WeightConfig` workflow
+- [ ] Code examples verified running end-to-end locally
+- [ ] `make html` confirmed — rendered doc looks correct
+- [ ] `pre-commit` passing
+
+---
 
 ## Phase IV: Pull Request
 
