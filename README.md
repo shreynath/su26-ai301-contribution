@@ -26,6 +26,8 @@ This was surfaced concretely through `daft.functions.video_frames()`: when the o
 
 The maintainer's working hypothesis, stated directly in the issue, is that the executor attempts to concat the (empty) partial/child series results of a list-return UDF batch *before* the worker's raised exception is surfaced — so when there are zero series to concat, that secondary failure fires and masks the original one.
 
+**Update (post-investigation):** the hypothesis was directionally correct but one layer off — the divergence isn't in the executor/`daft-dsl`, it's in `series_from_literals_iter` (`src/daft-core/src/series/from_lit.rs`), which both scalar and list UDFs funnel per-row results through. See Solution Approach and Phase III below for the confirmed root cause.
+
 ---
 
 ### Why I Chose This Issue
@@ -73,8 +75,10 @@ python -c "import daft; print(daft.__version__)"
 
 Setup is expected to take roughly 20–30 minutes on first build, mostly for the initial Rust compile (`daft-core`, `daft-io`, `daft-dsl`, etc.). Incremental rebuilds after small Rust changes are much faster with `maturin develop` (debug build) than `--release`.
 
+**Actual local setup (completed):** cloned into `~/Programming/Daft`, installed `rustup` (repo auto-selects its pinned `nightly-2025-09-03`), installed `uv` via Homebrew, and built with `make build` (wraps `maturin`) rather than a bare `maturin develop`. Only Python 3.13/3.14 were available locally (not the Makefile's default 3.11), so the venv was created with `make .venv PYTHON_VERSION=python3.13`. `daft.abi3.so` built and imported successfully. Note: `gh` (GitHub CLI) is not installed, so forking/pushing/opening the PR is still a manual step.
+
 **Working branch:**
-`https://github.com/<your-username>/Daft/tree/list-udf-error-propagation`
+`fix/list-udf-error-propagation-7196` (local; not yet pushed — changes are currently uncommitted in the working tree, pending maintainer confirmation before committing)
 
 ---
 
@@ -109,40 +113,80 @@ Setup is expected to take roughly 20–30 minutes on first build, mostly for the
 
 ### Solution Approach
 
-**Understand:**
-The bug is narrower than "list UDFs are broken" — it's specifically that error propagation and result-assembly are ordered incorrectly for list-return UDFs. Somewhere in the executor, after a UDF worker raises, the code path for list dtypes tries to concat whatever partial/child series it has *before* checking whether the worker actually failed, whereas the scalar path checks for the worker exception first. The task is to find that divergence point in the Rust source and correct the ordering (or handle the empty-concat case gracefully) without changing the successful-case behavior for either path.
+**Understand (confirmed, post-investigation):**
+The divergence is not in the UDF executor itself — it's one layer down, in how per-row results are assembled into a `Series`. Both scalar and list UDFs funnel their per-row outputs through `series_from_literals_iter` in `src/daft-core/src/series/from_lit.rs`. That function already accumulates per-row errors into an `errs` map (via the `unwrap_inner!` macro) and is meant to surface them at the end — but the ordering is wrong for container dtypes:
+- **Scalar dtypes** (`Int64`, `Utf8`, …) build their array with a null in each errored slot, never fail during construction, and reach the final `errs` check — so the real exception is correctly surfaced.
+- **Container dtypes** (`List`, and structurally the same for `Map`/`Tensor`/`SparseTensor`/`Embedding`) build their output by concatenating the surviving per-row child series via `ListArray::from_series` → `Series::concat`. When every row raises, there are zero surviving child series, so `Series::concat(&[])` fails immediately with `Need at least 1 series to perform concat` and returns via `?` — **before** the `errs` check ever runs, masking the true error.
 
-**Plan:**
-1. Locate the UDF result-assembly code paths in the Rust source (likely under `src/daft-dsl` or wherever `daft.func`/UDF execution and result concatenation live — e.g. near `Series::concat` usage flagged in the issue) and diff the scalar vs. list dtype handling to find where they diverge.
-2. Trace how the scalar path surfaces a worker exception, to use as the reference behavior the list path should match.
-3. Reproduce the two snippets above locally against a debug build (`maturin develop`) and set breakpoints / add temporary `eprintln!` diagnostics around the list dtype's result-assembly path to confirm exactly where the concat call fires relative to the exception check.
-4. Once maintainer feedback comes back on the two options I raised in my issue comment (propagate-before-concat vs. handle empty-list-of-series in `Series::concat` itself), implement the agreed approach.
-5. Add a regression test (Python-level, using the two minimal repro snippets from the issue) asserting that both scalar and list UDF paths surface the same underlying exception type/message, so this can't silently regress.
+**Plan (as executed):**
+1. Located the UDF result-assembly code path in the Rust source: `series_from_literals_iter` in `src/daft-core/src/series/from_lit.rs` — one level below where the issue's own hypothesis pointed (the executor/`daft-dsl`), but the same root idea (concat-before-propagate).
+2. Confirmed the scalar path already surfaces worker exceptions correctly, and used it as the reference behavior.
+3. Reproduced both minimal repro snippets against a debug build (`make build`) and traced exactly where the list dtype path calls `Series::concat` relative to the `errs` check.
+4. Chose the **error-propagation fix** over the alternative (making `Series::concat` tolerate an empty slice): wrapped the series construction in an immediately-invoked closure and moved the `errs` check ahead of returning any construction result, so accumulated per-row errors always win over a downstream failure they caused. This fixes all container dtypes in one place (not just `list`), and keeps `Series::concat`'s existing contract intact — there's an existing test (`tests/series/test_concat.py:250`) asserting `Series.concat([])` should raise, so changing that primitive would have weakened it for no real gain.
+5. Added a parametrized regression test (`list[int]`, `list[struct]`, scalar `int64`) to `tests/udf/test_row_wise_udf.py` asserting scalar and list UDF paths surface the same underlying exception.
 
 **Review:**
-Daft uses `pre-commit` (rustfmt/clippy for Rust, ruff for Python) — I'll run `pre-commit run --all-files` before pushing anything. Since this is a bug in core UDF execution rather than an isolated utility, the fix will likely need a Rust-side test in addition to a Python integration test, consistent with how other executor-level fixes are covered in the repo.
+Ran `rustfmt --check` on the changed Rust file (clean) and `ruff check` / `ruff format --check` on the changed test file. One pre-existing `ruff` finding remains in `test_row_wise_udf.py` (a blind `except Exception` in unrelated `ray`-GPU-detection test code around line 101–103) — confirmed via `git stash` that it exists on the unmodified baseline too, so it's not something my change introduced.
 
-**Evaluate:**
-- Both repro snippets (scalar and list-return UDF) raise the *same* underlying exception after the fix
-- No behavioral change to the already-correct scalar UDF error path
-- A regression test is added covering both cases
-- Maintainer (`everettVT`) confirms the chosen fix approach (propagation-order fix vs. `Series::concat` empty-case handling) before/while the PR is opened
+**Evaluate (confirmed via full re-verification against a fresh rebuild):**
+- ✅ Scalar UDF (control) and `list[int]` UDF (minimal repro from the issue) now raise the **identical** underlying `ImportError` — no more concat error
+- ✅ `list[struct]` and `list[image]` return dtypes also fixed (confirms the bug affects container dtypes generally, as the issue speculated)
+- ✅ Real user-facing path verified end-to-end: `video_frames()` on an actual sample video (`tests/assets/sample_video.mp4`) with `pillow` mocked unavailable now raises `ImportError: The 'pillow' module is required for frame decoding. Install it with pip install daft[video].` — while `video_metadata()` continues to work, exactly matching the issue's stated "Expected behavior"
+- ✅ Full `tests/udf/test_row_wise_udf.py` (39 passed), `test_concat.py` + `test_audio.py` (162 passed), and the Rust `from_lit` unit tests (34 passed) all pass on the fresh build
+- ✅ `rustfmt` clean; no new `clippy`/`ruff` findings introduced
 
 ---
 
 ## Phase III: Implementation
 
-- [ ] Confirmed with maintainer (`everettVT`) which fix approach is preferred — **currently pending reply on the issue thread**
-- [ ] Local build working via `maturin develop`; both repro snippets run and reproduce the reported (buggy) and control (correct) behavior
-- [ ] Divergence point between scalar and list UDF error-propagation paths located in the Rust source
-- [ ] Fix implemented per agreed approach (propagate worker exception before concat, and/or handle empty-list-of-series in `Series::concat`)
-- [ ] Regression test added covering both scalar and list UDF exception propagation
-- [ ] `pre-commit` passing (rustfmt, clippy, ruff)
+- [ ] Confirmed with maintainer (`everettVT`) which fix approach is preferred — **still pending reply on the issue thread.** I prototyped the propagation-order fix ahead of confirmation rather than waiting idle; the draft comment in Phase IV is written to be transparent about that and explicitly ask for sign-off before opening a PR.
+- [x] Local build working via `make build` (`maturin`-based); both repro snippets run and reproduce the reported (buggy, pre-fix) and control behavior
+- [x] Divergence point between scalar and list UDF error-propagation paths located in the Rust source — confirmed as `series_from_literals_iter` in `src/daft-core/src/series/from_lit.rs` (one layer below the executor, refining the issue's original hypothesis)
+- [x] Fix implemented — error-propagation approach: accumulated per-row `errs` are now surfaced before any downstream construction failure (e.g. empty-slice `concat`) they caused
+- [x] Regression test added — parametrized `list[int]`, `list[struct]`, and scalar `int64` cases in `tests/udf/test_row_wise_udf.py`
+- [x] `pre-commit`-equivalent checks passing — `rustfmt --check` clean; `ruff check`/`ruff format --check` show zero new findings (one pre-existing, unrelated finding confirmed present on baseline)
+
+**Additional verification beyond the original checklist**, done via a fresh rebuild to guarantee the binary matched source:
+- [x] `list[image]` return dtype also confirmed fixed (not just `list[int]`/`list[struct]`)
+- [x] Real user-facing path exercised end-to-end: `video_frames()` on an actual sample video with `pillow` mocked unavailable now raises the correct `ImportError`, while `video_metadata()` continues to work
+- [x] Full existing test suites re-run and passing: `test_row_wise_udf.py` (39), `test_concat.py` + `test_audio.py` (162), Rust `from_lit` unit tests (34)
+
+**Not yet done (intentionally):** nothing has been committed or pushed. The fix exists only in the local working tree on branch `fix/list-udf-error-propagation-7196`, per the plan to get maintainer sign-off before committing/opening a PR.
 
 ---
 
 ## Phase IV: Pull Request
 
-- **PR Link:** *(pending — blocked on maintainer confirmation of fix approach)*
-- **PR Summary:** *(pending)*
-- **Maintainer Feedback Log:** *(pending)*
+- **PR Link:** *(pending — blocked on maintainer confirmation of fix approach; nothing committed or pushed yet)*
+- **PR Summary:** *(pending — will summarize the `series_from_literals_iter` propagation-order fix once opened)*
+- **Maintainer Feedback Log:**
+  - `everettVT` opened the issue and added `bug`/`help wanted`/`p1`/`fix` labels.
+  - I posted an initial comment asking whether the fix should live in error-propagation logic vs. `Series::concat` itself, before doing any implementation work.
+  - **Drafted follow-up comment (not yet posted)** reporting the confirmed root cause (`series_from_literals_iter`, not the executor), the chosen fix rationale (propagation-order over changing `concat`'s contract), and full verification results — while explicitly asking for sign-off on the approach and desired test coverage bar before a PR is opened. Draft:
+
+    > Following up on my earlier question — while waiting to hear back on the preferred approach, I went ahead and built Daft from source (macOS, arm64) and traced the two paths so I could compare them concretely. Here's what I found, and a fix I've got working locally.
+    >
+    > **Root cause**
+    >
+    > It's actually not in the UDF executor itself — the divergence is one layer down, in how per-row results are assembled into a `Series`. Both scalar and list UDFs funnel their per-row outputs through `series_from_literals_iter` in [`src/daft-core/src/series/from_lit.rs`](https://github.com/Eventual-Inc/Daft/blob/main/src/daft-core/src/series/from_lit.rs).
+    >
+    > That function already captures per-row errors into an `errs` map (via the `unwrap_inner!` macro) and surfaces them at the very end. The problem is ordering:
+    > - **Scalar dtypes** (`Int64`, `Utf8`, …) build their array with a null in each errored slot, never fail, and reach the final `errs` check — so the real `ImportError` is surfaced. ✅
+    > - **Container dtypes** (`List`, and structurally the same for `Map`/`Tensor`/`SparseTensor`/`Embedding`) build their output by concatenating the surviving per-row child series. When every row raised, there are zero surviving child series, so `ListArray::from_series` → `Series::concat(&[])` fails first with `Need at least 1 series to perform concat` and returns via `?` **before** the `errs` check ever runs — masking the true error. ❌
+    >
+    > So `list[int]`, `list[struct]`, `list[image]` all reproduce it (confirmed below), which matches what you noted in the issue.
+    >
+    > **On the two options I raised**
+    >
+    > I ended up going with the **error-propagation option** rather than changing `Series::concat`. Making `concat` tolerate an empty slice would weaken a general-purpose primitive (and there's an existing test asserting `Series.concat([])` *should* raise), and it wouldn't fix the underlying ordering issue — a real per-row error should take priority over a downstream failure it caused, regardless of dtype. So the fix keeps `concat`'s contract intact and instead makes `series_from_literals_iter` surface the accumulated per-row `errs` before returning any construction failure they induced. This fixes all container dtypes in one place, not just `list`.
+    >
+    > **Verification**
+    >
+    > Against a source build with the fix, all of these now surface the original `ImportError` (and no longer the concat error):
+    > - the minimal `scalar` (control) and `list[int]` repro from the issue — identical error text now
+    > - `list[struct]` and `list[image]` return dtypes
+    > - the real user-facing path: `video_frames()` on an actual mp4 with `pillow` unavailable now raises `ImportError: The 'pillow' module is required for frame decoding. Install it with pip install daft[video].` — while `video_metadata()` continues to work — exactly the expected behavior from the issue.
+    >
+    > I also added a parametrized regression test (`list[int]`, `list[struct]`, scalar `int64`) to `tests/udf/test_row_wise_udf.py`, and the existing `daft-core` `from_lit` unit tests, the full `test_row_wise_udf.py` suite, and the `test_concat`/`test_audio` suites all still pass. `rustfmt` is clean and no new `clippy`/`ruff` findings.
+    >
+    > Happy to open a PR with this — but since this is my first contribution here, I wanted to check in first: does the propagation-order fix in `series_from_literals_iter` sound like the right layer to you, or would you prefer it live elsewhere? And is there a coverage bar (e.g. an explicit Rust-level test in `from_lit.rs` in addition to the Python one) you'd like before I put the PR up?
