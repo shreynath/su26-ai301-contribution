@@ -9,30 +9,34 @@
 
 ### Issue
 
-🔗 **https://github.com/pytorch/ao/issues/1920**
+🔗 **https://github.com/Eventual-Inc/Daft/issues/7196**
 
-**Repository:** pytorch/ao (torchao)
-**Organization:** PyTorch (Meta Open Source)
-**Languages:** Python, CUDA
-**Labels:** `good first issue`, `triaged`
+**Repository:** Eventual-Inc/Daft
+**Organization:** Eventual (Daft — high-performance data engine for AI/multimodal workloads)
+**Languages:** Rust, Python
+**Labels:** `bug`, `fix`, `help wanted`, `p1`
 
 ---
 
 ### Problem Summary
 
-torchao is PyTorch's native library for quantization and sparsity, developed under the PyTorch org and used to accelerate model training and inference across the LLM ecosystem. Issue #1920, opened by maintainer `jcaip`, comes out of a training recipe for 2:4 activation sparsity: FFNs built with Squared-ReLU activations (instead of the more common SwiGLU) exhibit greater than 85% activation sparsity with minimal accuracy loss. The original plan was to accelerate the resulting sparse-activation × dense-weight matmul using 2:4 structured sparsity, which caps theoretical speedup at 2x because it only enforces 50% sparsity — well below the 85%+ actually present in the activations.
+Daft is a Rust-powered, Python-native distributed data engine used for multimodal and AI data processing (images, audio, video, structured data). Issue #7196, opened by maintainer `everettVT`, reports that when a scalar UDF (`@daft.func`) raises an exception, Daft correctly propagates the underlying error to the user. However, when a UDF with a `list[...]` return dtype raises the exact same exception, the real error is swallowed and replaced with a cryptic, unrelated error: `DaftError::ValueError Need at least 1 series to perform concat`.
 
-Maintainer `janeyx99` proposed a different angle: instead of (or in addition to) accelerating the matmul, use **activation compression** to exploit the actual sparsity level for memory savings. The idea is to compress the sparse Squared-ReLU activations with NVIDIA's **nvcomp** library before storing them for the backward pass, then decompress on the way into the backward computation. This trades compute for memory, which matters because activation memory (not FLOPs) is often the binding constraint for training large FFNs. The concrete next step, agreed on by `jcaip`, is to benchmark nvcomp's compression ratio and runtime overhead on sparse Squared-ReLU activation tensors before anyone commits to building the actual `quantize_`/tensor-subclass integration into torchao.
+This was surfaced concretely through `daft.functions.video_frames()`: when the optional `pillow` dependency is missing, the function is supposed to raise a clear `ImportError` telling the user to `pip install daft[video]`. Instead, users see the confusing concat error, with no indication that a missing dependency is the actual cause. `video_metadata()` (a scalar-return function) does not hit this bug, which is what makes the divergence between scalar- and list-return UDF error handling visible.
+
+The maintainer's working hypothesis, stated directly in the issue, is that the executor attempts to concat the (empty) partial/child series results of a list-return UDF batch *before* the worker's raised exception is surfaced — so when there are zero series to concat, that secondary failure fires and masks the original one.
 
 ---
 
 ### Why I Chose This Issue
 
-This issue sits closer to systems/ML-infra work than a typical documentation fix, and it let me engage with a real open research question instead of a self-contained bug. The scope is well-bounded for a first contribution: the maintainers have explicitly said the first deliverable is *benchmarking numbers*, not a production PR — `jcaip` wrote that he isn't currently working on this and "would gladly accept a PR" once the overhead/compression-ratio picture is understood. That means "done" for Phase I–III is unambiguous: a reproducible benchmark script and a written summary of nvcomp's compression ratio and latency overhead on representative sparse activation tensors.
+This is a very recently opened (July 2, 2026), fully unclaimed issue — no assignee, no linked PR — filed directly by a Daft maintainer with `help wanted` and `p1` labels, meaning it's both wanted and considered a real priority rather than backlog filler. That combination is rare: most other unassigned "good first issue"-style candidates I checked in Daft, vLLM, and torchao already had an open PR against them by the time I looked, even though they still showed as unclaimed in older reference data.
 
-I also liked that the issue has an active, multi-year discussion thread (opened March 2025, still being triaged as of mid-2026) with several contributors probing different angles — CPU inference, unstructured sparsity, kernel-level 2:4 acceleration — which gave me real context to read before jumping in. Rather than fabricate a starting point, I actually posted on the thread to confirm the benchmarking approach was still the right entry point and hadn't gone stale; `janeyx99` looped in `vkuzo` (co-owner of quantization/sparsity efforts in torchao) to confirm relevance, and I'm currently waiting on that confirmation before opening any code. This mirrors how real open-source contribution starts: aligning with maintainers before writing throwaway code.
+The bug is also explicitly reproducible on macOS (the reporter's own environment is macOS arm64), and it has nothing to do with CUDA or GPU-specific code paths — it's a pure error-propagation / executor-logic bug in how list-return UDF results are assembled after a worker exception. That makes it realistic to fully reproduce, debug, and eventually fix on my own Mac, without needing GPU access or a hardware-gated CI environment, which ruled out several other otherwise-appealing candidates in vLLM and torchao's CUDA-heavy repos.
 
-The technical surface — GPU memory profiling, activation sparsity patterns, and a compression library's Python bindings — is a good stretch for my background in binary/systems work from SEFCOM without requiring me to write new CUDA kernels, which the maintainers themselves flagged as the harder, longer-term part of this issue.
+The issue also comes with a clean, minimal, dependency-free repro (no video files, no `pillow`/`av` needed) contrasting a scalar UDF (works correctly) against a list-return UDF (fails), which gives me a very concrete, bounded starting point: trace why the two code paths diverge. Per the maintainer's own framing, the surface fix is about correct error propagation, not a large new feature, which makes "done" reasonably well-defined for a first Rust-touching contribution to a top-tier data engineering repo.
+
+Before writing any code, I posted on the issue thread to confirm the direction: I noted the likely root cause (concat-before-propagate on an empty list-of-series) and asked whether the fix should live purely in the error-propagation logic (surface the worker's exception before attempting the concat) or whether `Series::concat` itself should handle the empty-list case by constructing an empty child array from the expected list dtype. I'm currently waiting on `everettVT`'s reply before scoping implementation work, mirroring how real open-source contribution starts — aligning with maintainers before writing throwaway code.
 
 ---
 
@@ -40,94 +44,105 @@ The technical surface — GPU memory profiling, activation sparsity patterns, an
 
 ### Environment Setup
 
-**OS:** Ubuntu 24.04
-**Python:** 3.11
-**PyTorch:** 2.7+ (nightly recommended for latest torchao compatibility)
-**CUDA:** 12.4
-**GPU:** required — nvcomp is a GPU-side compression library, so this benchmark cannot run on CPU-only hardware
+**OS:** macOS (Apple Silicon or Intel — no GPU/CUDA dependency for this issue)
+**Python:** 3.10+
+**Rust:** stable toolchain via `rustup` (Daft's core engine is Rust, exposed to Python via PyO3/maturin)
+**Build tool:** `maturin`
 
 **Setup steps:**
 ```bash
 # 1. Fork and clone the repo
-git clone https://github.com/<your-username>/ao.git
-cd ao
+git clone https://github.com/<your-username>/Daft.git
+cd Daft
 
-# 2. Create a virtual environment
+# 2. Install Rust (if not already installed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup default stable
+
+# 3. Create a virtual environment
 python -m venv .venv
 source .venv/bin/activate
 
-# 3. Install torch + torchao in editable mode
-pip install torch --index-url https://download.pytorch.org/whl/cu124
-pip install -e ".[dev]"
+# 4. Install maturin and build Daft in editable/develop mode
+pip install maturin
+maturin develop  # use --release for a slower build but faster runtime while benchmarking
 
-# 4. Install nvCOMP's Python bindings (NVIDIA-published wheel, matched to CUDA 12)
-pip install nvidia-nvcomp-cu12
-
-# 5. Sanity check the nvcomp import and version
-python -c "from nvidia import nvcomp; print('nvcomp version:', nvcomp.__version__)"
-
-# 6. Confirm torchao's sparsity utilities are importable (for generating 2:4/unstructured
-#    sparse test tensors to benchmark against)
-python -c "from torchao.sparsity import sparsify_; print('OK')"
+# 5. Sanity check the build
+python -c "import daft; print(daft.__version__)"
 ```
 
-Setup is expected to take about 30–45 minutes, mostly for the PyTorch nightly and CUDA toolkit matching. The main risk flagged in the issue thread itself is a CUDA/driver version mismatch between the nvcomp wheel and whatever CUDA build of PyTorch is installed, since nvcomp ships CUDA-version-specific wheels (`nvidia-nvcomp-cu11` vs `nvidia-nvcomp-cu12`).
+Setup is expected to take roughly 20–30 minutes on first build, mostly for the initial Rust compile (`daft-core`, `daft-io`, `daft-dsl`, etc.). Incremental rebuilds after small Rust changes are much faster with `maturin develop` (debug build) than `--release`.
 
 **Working branch:**
-`https://github.com/<your-username>/ao/tree/activation-compression-nvcomp-bench`
+`https://github.com/<your-username>/Daft/tree/list-udf-error-propagation`
 
 ---
 
 ### Steps to Reproduce
 
-There is no existing bug to reproduce here — this is a benchmarking task that starts from scratch — so "reproduction" means establishing the baseline the issue is asking about:
+1. Confirm the control case works correctly — a scalar UDF that raises should propagate its real exception:
+   ```python
+   import daft
+   from daft import col
 
-1. Generate a synthetic activation tensor that mimics a Squared-ReLU FFN's activation statistics: apply `x.relu().square()` to a random Gaussian input tensor, which produces the same clipped, highly-sparse distribution (>85% zeros) described in the linked paper.
-2. Confirm the sparsity level empirically: `(activation == 0).float().mean()` should land in the 85%+ range referenced in the issue.
-3. Feed the same tensor through nvcomp's `Codec` across several supported algorithms (LZ4, GDeflate, Bitcomp, ANS, Zstd) and record the compressed buffer size relative to the uncompressed buffer size for each.
-4. **Expected (per the issue's premise):** because the activation tensor is mostly zeros, general-purpose compressors should achieve a compression ratio well beyond the 2x ceiling that 2:4 structured sparsity can offer, at some added compress/decompress latency.
-5. **Actual (unknown, to be measured):** this is exactly the open question `jcaip` posed — the compression ratio and, critically, the added latency of compress-then-store / load-then-decompress versus just storing the dense activation, need to be measured before anyone can say whether this is a net win for training throughput.
+   @daft.func(return_dtype=daft.DataType.int64())
+   def scalar_import_error(x):
+       raise ImportError("The 'pillow' module is required. Install daft[video].")
+
+   daft.from_pydict({"x": [1]}).with_column("y", scalar_import_error(col("x"))).collect()
+   # Expected & actual: DaftError::ComputeError ... ImportError: The 'pillow' module is required...
+   ```
+2. Reproduce the bug — the same exception raised from a `list[...]`-return UDF should propagate identically, but doesn't:
+   ```python
+   @daft.func(return_dtype=daft.DataType.list(daft.DataType.int64()))
+   def list_import_error(x):
+       raise ImportError("The 'pillow' module is required. Install daft[video].")
+
+   daft.from_pydict({"x": [1]}).with_column("y", list_import_error(col("x"))).collect()
+   # Actual (buggy): DaftError::ValueError Need at least 1 series to perform concat
+   # Expected: the same ImportError as the scalar case
+   ```
+3. **Expected (per the issue's premise):** list-return UDFs should surface the worker's original exception, exactly like scalar UDFs do.
+4. **Actual:** the concat step over the list UDF's (empty, post-failure) child series results fails first, masking the real error entirely — this reproduces cleanly and consistently on macOS with no external dependencies.
 
 ---
 
 ### Solution Approach
 
 **Understand:**
-The task is narrower than "add activation compression to torchao" — it is "produce the numbers that tell us whether activation compression is worth building." Two things need measuring: (1) compression ratio on realistic sparse Squared-ReLU activations, and (2) the wall-clock overhead of compression/decompression relative to the FFN forward/backward pass it would sit inside, since GPU compression only helps if the memory savings outweigh the added compute time in a training step.
+The bug is narrower than "list UDFs are broken" — it's specifically that error propagation and result-assembly are ordered incorrectly for list-return UDFs. Somewhere in the executor, after a UDF worker raises, the code path for list dtypes tries to concat whatever partial/child series it has *before* checking whether the worker actually failed, whereas the scalar path checks for the worker exception first. The task is to find that divergence point in the Rust source and correct the ordering (or handle the empty-concat case gracefully) without changing the successful-case behavior for either path.
 
 **Plan:**
-1. Read the referenced paper (`https://openreview.net/pdf?id=O5feVk7p6Y`) to pull realistic activation shapes and sparsity statistics for representative FFN sizes, rather than using arbitrary synthetic shapes.
-2. Write a small benchmarking script (`benchmarks/nvcomp_activation_compression.py`) that:
-   - Constructs Squared-ReLU activation tensors at a few representative sizes (e.g. matching a 7B-class FFN's intermediate dimension)
-   - Runs nvcomp's `Codec` across multiple algorithms (LZ4, GDeflate, Bitcomp, ANS, Zstd — the set nvcomp exposes) and records compressed size vs. original size
-   - Times compress and decompress calls using CUDA events (not wall-clock `time.time()`, to avoid host/device sync noise) and reports overhead as a percentage of a representative FFN forward+backward step
-3. Compare the best-performing algorithm's compression ratio against the 2x ceiling of 2:4 structured sparsity, to directly answer the question the issue raises.
-4. Write up results as a short markdown summary (compression ratio table + overhead table) and post it back on issue #1920 before writing any integration code, per `jcaip`'s guidance that a PR should follow, not precede, the benchmarking.
-5. Only after maintainer sign-off on the numbers, scope out what a `quantize_`-style or tensor-subclass-based integration into torchao would look like for the actual PR.
+1. Locate the UDF result-assembly code paths in the Rust source (likely under `src/daft-dsl` or wherever `daft.func`/UDF execution and result concatenation live — e.g. near `Series::concat` usage flagged in the issue) and diff the scalar vs. list dtype handling to find where they diverge.
+2. Trace how the scalar path surfaces a worker exception, to use as the reference behavior the list path should match.
+3. Reproduce the two snippets above locally against a debug build (`maturin develop`) and set breakpoints / add temporary `eprintln!` diagnostics around the list dtype's result-assembly path to confirm exactly where the concat call fires relative to the exception check.
+4. Once maintainer feedback comes back on the two options I raised in my issue comment (propagate-before-concat vs. handle empty-list-of-series in `Series::concat` itself), implement the agreed approach.
+5. Add a regression test (Python-level, using the two minimal repro snippets from the issue) asserting that both scalar and list UDF paths surface the same underlying exception type/message, so this can't silently regress.
 
 **Review:**
-torchao uses standard Python style with `pre-commit` hooks; I'll run `pre-commit run --all-files` on the benchmark script before pushing. Since this starts as a benchmarking script rather than a library change, I'll place it under `benchmarks/` rather than `torchao/`, consistent with how other exploratory sparsity benchmarks are organized in the repo.
+Daft uses `pre-commit` (rustfmt/clippy for Rust, ruff for Python) — I'll run `pre-commit run --all-files` before pushing anything. Since this is a bug in core UDF execution rather than an isolated utility, the fix will likely need a Rust-side test in addition to a Python integration test, consistent with how other executor-level fixes are covered in the repo.
 
 **Evaluate:**
-- Benchmark script runs end-to-end on a CUDA-enabled machine and produces a reproducible compression-ratio + overhead table
-- Results directly answer the question posed in the issue: does nvcomp compression beat the 2x ceiling of 2:4 sparsity, and at what overhead cost?
-- Maintainers (`jcaip`, `janeyx99`, and/or `vkuzo` once they weigh in) confirm the benchmarking methodology is sound and the direction is still relevant before I scope a follow-up implementation PR
+- Both repro snippets (scalar and list-return UDF) raise the *same* underlying exception after the fix
+- No behavioral change to the already-correct scalar UDF error path
+- A regression test is added covering both cases
+- Maintainer (`everettVT`) confirms the chosen fix approach (propagation-order fix vs. `Series::concat` empty-case handling) before/while the PR is opened
 
 ---
 
 ## Phase III: Implementation
 
-- [ ] Confirmed with maintainers (`janeyx99`/`vkuzo`) that the nvcomp benchmarking direction is still current — **currently pending reply on the issue thread**
-- [ ] `benchmarks/nvcomp_activation_compression.py` written and generating representative sparse Squared-ReLU activation tensors
-- [ ] Compression ratio measured across nvcomp algorithms (LZ4, GDeflate, Bitcomp, ANS, Zstd)
-- [ ] Compress/decompress overhead measured via CUDA events, expressed relative to a representative FFN forward+backward step
-- [ ] Results written up and posted back to issue #1920 for maintainer feedback
-- [ ] `pre-commit` passing on the benchmark script
+- [ ] Confirmed with maintainer (`everettVT`) which fix approach is preferred — **currently pending reply on the issue thread**
+- [ ] Local build working via `maturin develop`; both repro snippets run and reproduce the reported (buggy) and control (correct) behavior
+- [ ] Divergence point between scalar and list UDF error-propagation paths located in the Rust source
+- [ ] Fix implemented per agreed approach (propagate worker exception before concat, and/or handle empty-list-of-series in `Series::concat`)
+- [ ] Regression test added covering both scalar and list UDF exception propagation
+- [ ] `pre-commit` passing (rustfmt, clippy, ruff)
 
 ---
 
 ## Phase IV: Pull Request
 
-- **PR Link:** *(pending — blocked on maintainer confirmation of direction)*
+- **PR Link:** *(pending — blocked on maintainer confirmation of fix approach)*
 - **PR Summary:** *(pending)*
 - **Maintainer Feedback Log:** *(pending)*
